@@ -18,6 +18,8 @@
 (define-constant ERR_INVALID_FEE_TIER (err u116))
 (define-constant ERR_INVALID_DISCOUNT (err u117))
 (define-constant ERR_FEE_CONFIGURATION_ERROR (err u118))
+(define-constant ERR_EXCEEDS_REMAINING (err u119))
+(define-constant ERR_INVALID_PARTIAL_AMOUNT (err u120))
 
 (define-data-var escrow-counter uint u0)
 (define-data-var platform-fee-rate uint u250)
@@ -34,6 +36,7 @@
     seller: principal,
     arbiter: principal,
     amount: uint,
+    released-amount: uint,
     status: (string-ascii 20),
     created-at: uint,
     expires-at: uint,
@@ -129,6 +132,7 @@
         seller: seller,
         arbiter: arbiter,
         amount: amount,
+        released-amount: u0,
         status: "active",
         created-at: current-block,
         expires-at: expires-at,
@@ -157,6 +161,8 @@
       (escrow-data (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
       (escrow-balance (unwrap! (map-get? escrow-balances { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
       (amount (get amount escrow-data))
+      (released-amount (get released-amount escrow-data))
+      (remaining-amount (- amount released-amount))
       (buyer (get buyer escrow-data))
       (dynamic-fee-rate (calculate-dynamic-fee-rate buyer amount))
       (platform-fee (/ (* amount dynamic-fee-rate) u10000))
@@ -167,15 +173,23 @@
       (is-eq tx-sender (get arbiter escrow-data))
     ) ERR_UNAUTHORIZED)
     (asserts! (is-eq (get status escrow-data) "active") ERR_ESCROW_NOT_ACTIVE)
-    (asserts! (> (get balance escrow-balance) u0) ERR_ALREADY_RELEASED)
+    (asserts! (> remaining-amount u0) ERR_ALREADY_RELEASED)
     
-    (try! (as-contract (stx-transfer? seller-amount tx-sender (get seller escrow-data))))
-    (try! (as-contract (stx-transfer? platform-fee tx-sender CONTRACT_OWNER)))
-    (update-user-fee-payment buyer platform-fee)
+    ;; Calculate fees to pay (total fees minus any already paid via partial releases)
+    (let (
+          (fees-already-paid u0) ;; No fees collected on partial releases
+          (remaining-fees (- platform-fee fees-already-paid))
+          (seller-payment (- remaining-amount remaining-fees))
+         )
+      ;; Transfer remaining amount to seller, minus platform fee
+      (try! (as-contract (stx-transfer? seller-payment tx-sender (get seller escrow-data))))
+      (try! (as-contract (stx-transfer? remaining-fees tx-sender CONTRACT_OWNER)))
+      (update-user-fee-payment buyer remaining-fees)
+    )
     
     (map-set escrows
       { escrow-id: escrow-id }
-      (merge escrow-data { status: "completed" })
+      (merge escrow-data { status: "completed", released-amount: amount })
     )
     
     (map-set escrow-balances
@@ -190,6 +204,75 @@
         seller-reviewed-buyer: false,
         completed-at: stacks-block-height
       }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Public function to release partial funds to seller
+(define-public (release-partial-funds (escrow-id uint) (amount-ustx uint))
+  (let (
+        (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) ERR_ESCROW_NOT_FOUND))
+        (caller tx-sender)
+        (remaining (- (get amount escrow) (get released-amount escrow)))
+       )
+    ;; Authorization: only buyer or arbiter can release funds
+    (asserts! (or (is-eq caller (get buyer escrow)) (is-eq caller (get arbiter escrow))) ERR_UNAUTHORIZED)
+
+    ;; Escrow must be active
+    (asserts! (is-eq (get status escrow) "active") ERR_ESCROW_NOT_ACTIVE)
+
+    ;; Must be a valid positive amount
+    (asserts! (> amount-ustx u0) ERR_INVALID_PARTIAL_AMOUNT)
+
+    ;; Check enough unreleased funds remain
+    (asserts! (<= amount-ustx remaining) ERR_EXCEEDS_REMAINING)
+
+    ;; Transfer specified amount to seller (no fees on partial releases)
+    (try! (as-contract (stx-transfer? amount-ustx tx-sender (get seller escrow))))
+
+    ;; Update released amount
+    (map-set escrows { escrow-id: escrow-id } 
+      (merge escrow { released-amount: (+ (get released-amount escrow) amount-ustx) }))
+
+    ;; If fully paid, mark escrow as completed and apply fees
+    (if (is-eq (+ (get released-amount escrow) amount-ustx) (get amount escrow))
+        (begin
+          ;; Calculate and apply fees on the total amount
+          (let (
+                (buyer (get buyer escrow))
+                (total-amount (get amount escrow))
+                (dynamic-fee-rate (calculate-dynamic-fee-rate buyer total-amount))
+                (platform-fee (/ (* total-amount dynamic-fee-rate) u10000))
+               )
+            ;; Transfer platform fee from seller (who has received full payment)
+            (try! (stx-transfer? platform-fee (get seller escrow) CONTRACT_OWNER))
+            (update-user-fee-payment buyer platform-fee)
+            
+            ;; Mark escrow as completed
+            (map-set escrows { escrow-id: escrow-id } 
+              (merge escrow { 
+                status: "completed",
+                released-amount: (+ (get released-amount escrow) amount-ustx)
+              }))
+              
+            ;; Update escrow balance to 0
+            (map-set escrow-balances { escrow-id: escrow-id } { balance: u0 })
+            
+            ;; Initialize review status
+            (map-set escrow-review-status
+              { escrow-id: escrow-id }
+              {
+                buyer-reviewed-seller: false,
+                seller-reviewed-buyer: false,
+                completed-at: stacks-block-height
+              })
+          )
+        )
+        ;; Update balance to reflect partial release
+        (map-set escrow-balances { escrow-id: escrow-id } 
+          { balance: (- (get amount escrow) (+ (get released-amount escrow) amount-ustx)) })
     )
     
     (ok true)
@@ -765,6 +848,62 @@
   )
 )
 
+;; Read-only function to get remaining balance for an escrow
+(define-read-only (get-escrow-remaining-balance (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow-data (- (get amount escrow-data) (get released-amount escrow-data))
+    u0
+  )
+)
+
+;; Read-only function to get released amount for an escrow
+(define-read-only (get-escrow-released-amount (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow-data (get released-amount escrow-data)
+    u0
+  )
+)
+
+;; Read-only function to check if partial release is allowed
+(define-read-only (can-release-partial-funds (escrow-id uint) (caller principal) (amount uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow-data (let
+      (
+        (remaining (- (get amount escrow-data) (get released-amount escrow-data)))
+      )
+      (and
+        (is-eq (get status escrow-data) "active")
+        (or 
+          (is-eq caller (get buyer escrow-data))
+          (is-eq caller (get arbiter escrow-data))
+        )
+        (> amount u0)
+        (<= amount remaining)
+        (> remaining u0)
+      )
+    )
+    false
+  )
+)
+
+;; Read-only function to get escrow completion percentage
+(define-read-only (get-escrow-completion-percentage (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow-data (if (is-eq (get amount escrow-data) u0)
+      u0
+      (/ (* (get released-amount escrow-data) u100) (get amount escrow-data))
+    )
+    u0
+  )
+)
+
+;; Read-only function to check if escrow is fully released
+(define-read-only (is-escrow-fully-released (escrow-id uint))
+  (match (map-get? escrows { escrow-id: escrow-id })
+    escrow-data (is-eq (get released-amount escrow-data) (get amount escrow-data))
+    false
+  )
+)
 (define-read-only (get-fee-tier (tier-id uint))
   (map-get? fee-tier-configs { tier-id: tier-id })
 )

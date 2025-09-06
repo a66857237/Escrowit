@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Escrowit.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.EscrowTemplates]
+path = 'contracts/EscrowTemplates.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
